@@ -17,7 +17,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     client
         .batch_execute(
-            "DROP TABLE IF EXISTS poc_items;
+            "DROP TABLE IF EXISTS poc_items CASCADE;
              CREATE TABLE poc_items (id SERIAL PRIMARY KEY, name TEXT, price INT);
              INSERT INTO poc_items (name, price) VALUES ('widget', 10), ('gadget', 25), ('gizmo', 5);",
         )
