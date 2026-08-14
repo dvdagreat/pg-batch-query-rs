@@ -61,23 +61,16 @@ away your database is.
 
 ## The catch: maintainability
 
-This is a performance win, not a free lunch. Stuffing unrelated statements
-into one string trades away most of what makes `tokio-postgres`/ORM query
-methods pleasant to work with day to day:
+This is a performance win, not a free lunch:
 
-- **No per-statement types.** `simple_query` returns a flat stream of
-  `SimpleQueryMessage`s — you have to track statement boundaries yourself
-  (see the `CommandComplete` bookkeeping in `main.rs`) instead of getting a
-  typed result back per call.
-- **Everything is text.** Simple query mode has no parameter binding, so
-  values get interpolated into the SQL string by hand, which reopens the
-  door to SQL injection if any of it comes from user input.
-- **One error kills the batch**, and it's not always obvious which statement
-  caused it.
-- **Harder to read and review.** A wall of semicolon-joined SQL in a string
-  literal doesn't get syntax highlighting, formatting, or the same scrutiny
-  a standalone query would in a PR.
+- No per-statement typed results — you track statement boundaries yourself
+  via `CommandComplete`.
+- No parameter binding — values go straight into the SQL string, which is a
+  SQL injection risk for user input.
+- One error fails the whole batch, and the failing statement isn't always
+  obvious.
+- Harder to review — one string of semicolon-joined SQL vs. separate,
+  readable queries.
 
-Worth reaching for when you know a hot path fires several unrelated,
-non-parameterized reads together and the round-trip cost is measurably
-hurting you — not as a default way to write queries.
+Best used for hot paths with known, non-parameterized reads — not as a
+default way to write queries.
