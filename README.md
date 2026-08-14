@@ -64,7 +64,7 @@ away your database is.
 This is a performance win, not a free lunch:
 
 - No per-statement typed results — you track statement boundaries yourself
-  via `CommandComplete`.
+  via `CommandComplete` (see `examples/typed_results.rs` for a fix).
 - No parameter binding — values go straight into the SQL string, which is a
   SQL injection risk for user input.
 - One error fails the whole batch, and the failing statement isn't always
@@ -74,3 +74,82 @@ This is a performance win, not a free lunch:
 
 Best used for hot paths with known, non-parameterized reads — not as a
 default way to write queries.
+
+## What about dependent queries?
+
+`simple_query` batches statements as static text sent all at once, so it
+can't handle a query that needs a value produced by the one before it — e.g.
+insert a record, then use its new id in the next insert. The client never
+sees that id in time to splice it into the batch.
+
+`examples/dependent_queries.rs` shows the fix: fold both statements into one
+query with a data-modifying CTE. The `INSERT ... RETURNING` feeds the id
+straight into the next `INSERT` inside Postgres itself, so it's still a
+single round trip — and since it's one real statement, normal parameter
+binding (`$1`, `$2`) works too:
+
+```rust
+let row = client
+    .query_one(
+        "WITH new_item AS (
+             INSERT INTO poc_items (name, price) VALUES ($1, $2)
+             RETURNING id
+         )
+         INSERT INTO poc_order_events (item_id, event_type)
+         SELECT id, 'created' FROM new_item
+         RETURNING id, item_id, event_type",
+        &[&"thingamajig", &42],
+    )
+    .await?;
+```
+
+Run it with `cargo run --example dependent_queries`.
+
+## What if a query in the batch fails?
+
+`examples/error_handling.rs` shows the other gotcha: a multi-statement
+`simple_query` batch runs as one implicit transaction. If a later statement
+errors, everything earlier in that same batch is rolled back too - even a
+successful insert.
+
+```rust
+match client.simple_query(batch).await {
+    Ok(_) => println!("batch succeeded"),
+    Err(err) => {
+        if let Some(db_err) = err.as_db_error() {
+            println!("batch failed: {}", db_err.message());
+        }
+    }
+}
+```
+
+`tokio_postgres::Error::as_db_error()` gives you the Postgres error message
+and `SqlState` (e.g. `UNIQUE_VIOLATION`) so you can branch on what went
+wrong. The example proves the rollback by re-querying the table afterward -
+the row from the first, individually-valid insert is gone.
+
+Run it with `cargo run --example error_handling`.
+
+## Getting typed results back
+
+`examples/typed_results.rs` addresses the other maintainability complaint
+above: `simple_query` only gives you untyped text rows. The fix is to define
+a small struct per statement and parse each row into it once, right where
+the batch is issued:
+
+```rust
+struct ItemCount { count: i64 }
+
+impl ItemCount {
+    fn from_row(row: &SimpleQueryRow) -> Self {
+        Self { count: row.get(0).unwrap_or("0").parse().unwrap_or(0) }
+    }
+}
+```
+
+Since the statement order in the batch is known, each row just gets routed
+to the matching struct as the results stream in — callers get back the same
+typed values they'd get from `client.query()`, instead of parsing text
+everywhere the batch is used.
+
+Run it with `cargo run --example typed_results`.
