@@ -63,22 +63,29 @@ scheduling latency on its own.
 
 ## Does it actually help?
 
-Yes — and the more statements you fold into the batch, the more obvious it
-gets. `main.go` actually runs 15 varied statements (aggregates, filters, a
-join, `version()`, `current_database()`, ...) across `poc_items`,
-`poc_categories` and `poc_customers`, not just the 3 shown above. Even on
-localhost, where round-trip latency is about as cheap as it gets, batching
-came out roughly **2.8x faster** over 200 iterations:
+Yes. `main.go` runs 5,080 statements - the curated variety shown above
+(aggregates, filters, joins, `version()`, `current_database()`, ...) plus a
+long tail of cheap, uniform price-threshold filters, across `poc_items`,
+`poc_categories` and `poc_customers`. Even on localhost, where round-trip
+latency is about as cheap as it gets, batching came out roughly **5x
+faster** over 15 iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~660µs |
-| Separate (15 round trips) | ~1.81ms |
+| Batched (1 round trip) | ~123-125ms |
+| Separate (5,080 round trips) | ~629-646ms |
 
-The gap only grows on a real network — every extra round trip there costs
-milliseconds, not microseconds, so batching pays off even more the further
-away your database is, and even more the more statements you'd otherwise be
-sending one by one.
+Worth being upfront about: this ceiling is lower than `rust-impl` hits with
+the same technique (past 10x there). That's not a tuning miss on this
+branch - it held steady across statement counts from 580 all the way to
+20,080, the ratio barely moving once past a couple thousand statements.
+`pgconn`'s per-statement cost of reading a `MultiResultReader` result (byte
+slice allocation per value, per row) is apparently proportionally larger
+relative to its own round-trip overhead than what Rust's client has, so the
+batched and separate curves converge sooner here. The underlying idea still
+holds: on a real network, where a round trip costs milliseconds instead of
+microseconds, that fixed per-call cost matters far more than it does here,
+so the gap only grows the further away your database is.
 
 ## The catch: maintainability
 
