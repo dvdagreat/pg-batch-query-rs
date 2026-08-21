@@ -1,5 +1,5 @@
-import type { QueryResultRow } from 'pg';
-import { createClient } from '../src/db.js';
+import type { Row } from 'postgres';
+import { createSql } from '../src/db.js';
 import { BatchExecutor, createRef, QueryBuilder } from '../src/queryBuilder.js';
 
 interface Product {
@@ -8,18 +8,17 @@ interface Product {
   price: number;
 }
 
-function productFromRow(row: QueryResultRow): Product {
+function productFromRow(row: Row): Product {
   return { id: row.id, name: row.name, price: row.price };
 }
 
 async function main(): Promise<void> {
-  const client = createClient();
-  await client.connect();
+  const sql = createSql();
 
-  await client.query(
-    `DROP TABLE IF EXISTS poc_products;
-     CREATE TABLE poc_products (id SERIAL PRIMARY KEY, name TEXT UNIQUE, price INT);`,
-  );
+  await sql`
+    DROP TABLE IF EXISTS poc_products;
+    CREATE TABLE poc_products (id SERIAL PRIMARY KEY, name TEXT UNIQUE, price INT);
+  `.simple();
 
   // A batch that mixes every statement kind, in whatever order the problem
   // calls for, chained onto one builder.
@@ -43,7 +42,7 @@ async function main(): Promise<void> {
     .select('product count', 'SELECT count(*) FROM poc_products', [], (row) => ({ count: Number(row.count) }), productCount)
     .build();
 
-  await BatchExecutor.execute(client, batch);
+  await BatchExecutor.execute(sql, batch);
 
   console.log(`deleted ${rowsDeleted.value} cheap product(s)`);
   for (const p of allProducts) {
@@ -59,16 +58,16 @@ async function main(): Promise<void> {
     .build();
 
   try {
-    await BatchExecutor.execute(client, failingBatch);
+    await BatchExecutor.execute(sql, failingBatch);
     console.log('failing batch succeeded (unexpected)');
   } catch (err) {
     console.log(`failing batch was rejected as expected: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  const result = await client.query('SELECT count(*) FROM poc_products');
-  console.log(`count after the failed batch: ${result.rows[0].count} (thingamajig was rolled back too)`);
+  const [row] = await sql`SELECT count(*) FROM poc_products`;
+  console.log(`count after the failed batch: ${row?.count} (thingamajig was rolled back too)`);
 
-  await client.end();
+  await sql.end();
 }
 
 main().catch((err: unknown) => {

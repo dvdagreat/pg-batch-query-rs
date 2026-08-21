@@ -1,5 +1,5 @@
-import { DatabaseError } from 'pg';
-import { createClient } from '../src/db.js';
+import postgres from 'postgres';
+import { createSql } from '../src/db.js';
 
 // Gotcha: when a multi-statement batch has more than one statement,
 // Postgres wraps them in one implicit transaction. If a later statement
@@ -8,25 +8,24 @@ import { createClient } from '../src/db.js';
 // shows how to read the error in TypeScript, then proves the rollback by
 // re-checking the table.
 async function main(): Promise<void> {
-  const client = createClient();
-  await client.connect();
+  const sql = createSql();
 
-  await client.query(
-    `DROP TABLE IF EXISTS poc_accounts;
-     CREATE TABLE poc_accounts (id SERIAL PRIMARY KEY, email TEXT UNIQUE);`,
-  );
+  await sql`
+    DROP TABLE IF EXISTS poc_accounts;
+    CREATE TABLE poc_accounts (id SERIAL PRIMARY KEY, email TEXT UNIQUE);
+  `.simple();
 
   // Statement 1 succeeds, statement 2 violates the UNIQUE constraint,
   // statement 3 never runs at all.
-  const batch = `INSERT INTO poc_accounts (email) VALUES ('a@example.com');
-                 INSERT INTO poc_accounts (email) VALUES ('a@example.com');
-                 SELECT count(*) FROM poc_accounts;`;
-
   try {
-    await client.query(batch);
+    await sql`
+      INSERT INTO poc_accounts (email) VALUES ('a@example.com');
+      INSERT INTO poc_accounts (email) VALUES ('a@example.com');
+      SELECT count(*) FROM poc_accounts;
+    `.simple();
     console.log('batch succeeded (unexpected)');
   } catch (err) {
-    if (err instanceof DatabaseError) {
+    if (err instanceof postgres.PostgresError) {
       console.log(`batch failed: ${err.message}`);
       if (err.code === '23505') {
         console.log('-> it was a unique violation, as expected');
@@ -38,10 +37,10 @@ async function main(): Promise<void> {
 
   // The implicit transaction rolled back statement 1 as well, so the table
   // should still be empty even though the first insert looked fine on its own.
-  const result = await client.query('SELECT count(*) FROM poc_accounts');
-  console.log(`rows in poc_accounts after the failed batch: ${result.rows[0].count}`);
+  const [row] = await sql<{ count: string }[]>`SELECT count(*) FROM poc_accounts`;
+  console.log(`rows in poc_accounts after the failed batch: ${row?.count}`);
 
-  await client.end();
+  await sql.end();
 }
 
 main().catch((err: unknown) => {

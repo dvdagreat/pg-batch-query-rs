@@ -1,14 +1,14 @@
-import { DatabaseError, type Client, type QueryResultRow } from 'pg';
+import postgres, { type Row, type Sql } from 'postgres';
 
-// A single pg Client processes one query at a time on the wire - queueing
-// several .query() calls without awaiting still sends them one after
-// another, so this batch is N round trips, not one. What it gives you
-// instead: real $1/$2 parameter binding, typed results via a mapper per
-// statement, atomic rollback on any failure (the whole batch runs in one
-// transaction), and per-statement error attribution logged as it happens.
+// sql.begin(sql => [...]) pipelines every returned query onto the wire in
+// one round trip and wraps them in a real transaction - so unlike a plain
+// sequential await loop, this batch keeps the single-round-trip property
+// *and* gets real $1/$2 parameter binding (via sql.unsafe, since our SQL
+// and params are built dynamically rather than as literal tagged templates),
+// typed results via a mapper per statement, and atomic rollback on failure.
 
 /** Maps one result row into a caller-defined type. */
-export type RowMapper<T> = (row: QueryResultRow) => T;
+export type RowMapper<T> = (row: Row) => T;
 
 /**
  * A mutable box for out-parameters. Primitives are copied by value in JS, so
@@ -61,7 +61,7 @@ export class BatchError extends Error {
   }
 
   private static describe(statementIndex: number, label: string, cause: unknown): string {
-    const detail = cause instanceof DatabaseError ? cause.message : String(cause);
+    const detail = cause instanceof postgres.PostgresError ? cause.message : String(cause);
     return `statement ${statementIndex} (${label}) failed: ${detail}`;
   }
 }
@@ -116,45 +116,38 @@ export class QueryBatch {
   constructor(readonly statements: readonly Statement[]) {}
 }
 
-/** Runs a `QueryBatch` inside one transaction, statement by statement. */
+/** Runs a `QueryBatch` inside one transaction, pipelined in a single round trip. */
 export class BatchExecutor {
-  static async execute(client: Client, batch: QueryBatch): Promise<void> {
+  static async execute(sql: Sql, batch: QueryBatch): Promise<void> {
     const { statements } = batch;
 
-    await client.query('BEGIN');
+    let results: readonly (readonly Row[])[];
     try {
-      for (let index = 0; index < statements.length; index++) {
-        const stmt = statements[index]!;
-        await BatchExecutor.runStatement(client, stmt, index);
-      }
-      await client.query('COMMIT');
+      results = await sql.begin((tx) =>
+        statements.map((stmt, index) =>
+          // unsafe() defaults to prepare: false, which - unlike literal
+          // tagged-template queries - opts out of the pipelining sql.begin
+          // otherwise gives an array of queries; prepare: true restores it.
+          tx.unsafe(stmt.sql, stmt.params as any[], { prepare: true }).catch((cause: unknown) => {
+            throw new BatchError(index, stmt.label, cause);
+          }),
+        ),
+      );
     } catch (err) {
-      console.error(`[batch] ${err instanceof Error ? err.message : String(err)} - rolling back`);
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error(`[batch] rollback also failed: ${String(rollbackErr)}`);
-      }
+      console.error(`[batch] ${err instanceof Error ? err.message : String(err)} - rolled back`);
       throw err;
     }
-  }
 
-  private static async runStatement(client: Client, stmt: Statement, index: number): Promise<void> {
-    const result = await client.query(stmt.sql, stmt.params as unknown[]).catch((cause: unknown) => {
-      throw new BatchError(index, stmt.label, cause);
-    });
-
-    if (stmt.kind === 'select') {
-      stmt.out.length = 0;
-      try {
-        for (const row of result.rows) {
+    statements.forEach((stmt, index) => {
+      const result = results[index]!;
+      if (stmt.kind === 'select') {
+        stmt.out.length = 0;
+        for (const row of result) {
           stmt.out.push(stmt.mapRow(row));
         }
-      } catch (cause) {
-        throw new BatchError(index, stmt.label, cause);
+      } else if (stmt.rowsAffected) {
+        stmt.rowsAffected.value = (result as unknown as { count: number }).count;
       }
-    } else if (stmt.rowsAffected) {
-      stmt.rowsAffected.value = result.rowCount ?? 0;
-    }
+    });
   }
 }

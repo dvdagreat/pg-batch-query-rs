@@ -1,28 +1,29 @@
-import type { QueryResult } from 'pg';
-import { createClient } from './db.js';
+import type { Row } from 'postgres';
+import { createSql } from './db.js';
 
 async function main(): Promise<void> {
-  const client = createClient();
-  await client.connect();
+  const sql = createSql();
 
-  await client.query(
-    `DROP TABLE IF EXISTS poc_items CASCADE;
-     CREATE TABLE poc_items (id SERIAL PRIMARY KEY, name TEXT, price INT);
-     INSERT INTO poc_items (name, price) VALUES ('widget', 10), ('gadget', 25), ('gizmo', 5);`,
-  );
+  await sql`
+    DROP TABLE IF EXISTS poc_items CASCADE;
+    CREATE TABLE poc_items (id SERIAL PRIMARY KEY, name TEXT, price INT);
+    INSERT INTO poc_items (name, price) VALUES ('widget', 10), ('gadget', 25), ('gizmo', 5);
+  `.simple();
 
   // Three unrelated SELECTs, sent as one semicolon-separated string with no
-  // parameter placeholders. node-postgres puts the whole thing in a single
+  // parameter placeholders. .simple() puts the whole thing in a single
   // Postgres simple-query message - one round trip for all three - and
-  // resolves with an array of results, one per statement, instead of one.
-  const batch = `SELECT count(*) FROM poc_items;
-                 SELECT name FROM poc_items WHERE price > 10;
-                 SELECT now();`;
+  // resolves with one row array per statement, in order.
+  const runBatch = () =>
+    sql`
+      SELECT count(*) FROM poc_items;
+      SELECT name FROM poc_items WHERE price > 10;
+      SELECT now();
+    `.simple();
 
-  const results = (await client.query(batch)) as unknown as QueryResult[];
-
-  results.forEach((result, statementIndex) => {
-    for (const row of result.rows) {
+  const results = (await runBatch()) as unknown as Row[][];
+  results.forEach((rows, statementIndex) => {
+    for (const row of rows) {
       console.log(`statement ${statementIndex} ->`, Object.values(row).join(' | '));
     }
   });
@@ -33,15 +34,15 @@ async function main(): Promise<void> {
 
   const batchedStart = performance.now();
   for (let i = 0; i < iterations; i++) {
-    await client.query(batch);
+    await runBatch();
   }
   const batchedMs = performance.now() - batchedStart;
 
   const separateStart = performance.now();
   for (let i = 0; i < iterations; i++) {
-    await client.query('SELECT count(*) FROM poc_items');
-    await client.query('SELECT name FROM poc_items WHERE price > 10');
-    await client.query('SELECT now()');
+    await sql`SELECT count(*) FROM poc_items`;
+    await sql`SELECT name FROM poc_items WHERE price > 10`;
+    await sql`SELECT now()`;
   }
   const separateMs = performance.now() - separateStart;
 
@@ -49,7 +50,7 @@ async function main(): Promise<void> {
   console.log(`batched (1 round trip):    ${batchedMs.toFixed(2)}ms  (${(batchedMs / iterations).toFixed(3)}ms/iter)`);
   console.log(`separate (3 round trips):  ${separateMs.toFixed(2)}ms  (${(separateMs / iterations).toFixed(3)}ms/iter)`);
 
-  await client.end();
+  await sql.end();
 }
 
 main().catch((err: unknown) => {

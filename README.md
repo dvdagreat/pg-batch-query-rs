@@ -11,7 +11,9 @@ npm start
 ```
 
 Assumes a local Postgres reachable at `host=localhost`, user `postgres`,
-password `password`, database `postgres` (see `src/db.ts`).
+password `password`, database `postgres` (see `src/db.ts`). Uses
+[`postgres`](https://github.com/porsager/postgres) (Postgres.js) as the
+driver, no ORM.
 
 ## Why not just use an ORM?
 
@@ -25,31 +27,33 @@ either:
   issue separate messages under the hood, or add a layer of query-building
   machinery just to get there.
 
-This POC skips the ORM entirely and talks to Postgres directly via `pg`. No
-query builder, no schema DSL — just SQL strings and one method call.
+This POC skips the ORM entirely and talks to Postgres directly. No query
+builder, no schema DSL — just SQL and one call.
 
 ## How it's solved
 
 The core trick: send several `SELECT`s as one semicolon-separated string
-with no parameter placeholders. Postgres treats that as a single message,
-runs each statement in order, and `pg` resolves the call with an array of
-results, one per statement:
+with no parameter placeholders, using `.simple()` to force Postgres' simple
+query protocol. That treats the whole string as a single message, runs each
+statement in order, and resolves with one row array per statement:
 
 ```ts
-const batch = `SELECT count(*) FROM poc_items;
-               SELECT name FROM poc_items WHERE price > 10;
-               SELECT now();`;
+const batch = sql`
+  SELECT count(*) FROM poc_items;
+  SELECT name FROM poc_items WHERE price > 10;
+  SELECT now();
+`.simple();
 
-const results = await client.query(batch);
+const [counts, expensive, times] = await batch;
 ```
 
 That's it — three unrelated queries, one call, one round trip. Compare that
 to the "normal" way:
 
 ```ts
-await client.query('SELECT count(*) FROM poc_items');
-await client.query('SELECT name FROM poc_items WHERE price > 10');
-await client.query('SELECT now()');
+await sql`SELECT count(*) FROM poc_items`;
+await sql`SELECT name FROM poc_items WHERE price > 10`;
+await sql`SELECT now()`;
 ```
 
 which is three separate request/response cycles, each paying network and
@@ -62,8 +66,8 @@ gets, batching came out faster over 200 iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~0.38ms |
-| Separate (3 round trips) | ~0.61ms |
+| Batched (1 round trip) | ~0.28ms |
+| Separate (3 round trips) | ~0.44ms |
 
 The gap only grows on a real network — every extra round trip there costs
 milliseconds, not microseconds, so batching pays off even more the further
@@ -73,11 +77,11 @@ away your database is.
 
 This is a performance win, not a free lunch:
 
-- No per-statement typed results by default — `pg` hands back an array of
-  generic result objects, one per statement, with no structure of your own.
+- No per-statement typed results by default — `.simple()` hands back a row
+  array per statement, with no structure of your own.
 - No parameter binding — this only works for plain SQL strings with no
-  `$1`-style values, so anything dynamic has to be interpolated by hand,
-  which is a SQL injection risk for user input.
+  placeholders, so anything dynamic has to be interpolated by hand, which is
+  a SQL injection risk for user input.
 - One error fails the whole batch, and the failing statement isn't always
   obvious.
 - Harder to review — one string of semicolon-joined SQL vs. separate,
@@ -97,19 +101,18 @@ never sees that id in time to splice it into the batch.
 query with a data-modifying CTE. The `INSERT ... RETURNING` feeds the id
 straight into the next `INSERT` inside Postgres itself, so it's still a
 single round trip — and since it's one real statement, normal parameter
-binding (`$1`, `$2`) works too:
+binding works too:
 
 ```ts
-const result = await client.query(
-  `WITH new_item AS (
-       INSERT INTO poc_items (name, price) VALUES ($1, $2)
-       RETURNING id
-   )
-   INSERT INTO poc_order_events (item_id, event_type)
-   SELECT id, 'created' FROM new_item
-   RETURNING id, item_id, event_type`,
-  ['thingamajig', 42],
-);
+const [row] = await sql<{ id: number; item_id: number; event_type: string }[]>`
+  WITH new_item AS (
+      INSERT INTO poc_items (name, price) VALUES (${name}, ${price})
+      RETURNING id
+  )
+  INSERT INTO poc_order_events (item_id, event_type)
+  SELECT id, 'created' FROM new_item
+  RETURNING id, item_id, event_type
+`;
 ```
 
 Run it with `npm run example:dependent-queries`.
@@ -122,35 +125,34 @@ earlier in that same batch is rolled back too - even a successful insert.
 
 ```ts
 try {
-  await client.query(batch);
+  await sql`...; ...;`.simple();
 } catch (err) {
-  if (err instanceof DatabaseError) {
+  if (err instanceof postgres.PostgresError) {
     console.log(`batch failed: ${err.message}`);
   }
 }
 ```
 
-`pg`'s `DatabaseError` (thrown for real Postgres errors) carries the
-message and a `code` (Postgres's `SQLSTATE`, e.g. `23505` for a unique
-violation) so you can branch on what went wrong. The example proves the
-rollback by re-querying the table afterward - the row from the first,
-individually-valid insert is gone.
+`postgres.PostgresError` carries the message and a `code` (Postgres's
+`SQLSTATE`, e.g. `23505` for a unique violation) so you can branch on what
+went wrong. The example proves the rollback by re-querying the table
+afterward - the row from the first, individually-valid insert is gone.
 
 Run it with `npm run example:error-handling`.
 
 ## Getting typed results back
 
 `examples/typedResults.ts` addresses the other maintainability complaint
-above: a multi-statement batch only gives you an array of generic result
-objects. The fix is to define an interface and a small mapper function per
-statement, right where the batch is issued:
+above: a multi-statement batch only gives you an array of generic row
+objects per statement. The fix is to define an interface and a small mapper
+function per statement, right where the batch is issued:
 
 ```ts
 interface ItemCount {
   count: number;
 }
 
-function itemCountFromRow(row: QueryResultRow): ItemCount {
+function itemCountFromRow(row: Row): ItemCount {
   return { count: Number(row.count) };
 }
 ```
@@ -168,9 +170,7 @@ The examples above are all built on multi-statement text batching, with the
 trade-offs documented above. `src/queryBuilder.ts` takes a different
 approach for when you want real ergonomics: a `QueryBuilder` you chain
 SELECTs, INSERTs, UPDATEs and DELETEs onto in any order, `build()` into a
-`QueryBatch`, and hand to `BatchExecutor.execute`. It runs each statement
-through the normal parameterized query API and wraps the whole batch in one
-real transaction:
+`QueryBatch`, and hand to `BatchExecutor.execute`:
 
 ```ts
 const products: Product[] = [];
@@ -183,15 +183,30 @@ const batch = new QueryBuilder()
   .select('all products', 'SELECT id, name, price FROM poc_products ORDER BY id', [], productFromRow, products)
   .build();
 
-await BatchExecutor.execute(client, batch);
+await BatchExecutor.execute(sql, batch);
 // products and rowsDeleted are populated here, but only if every
 // statement above succeeded.
 ```
 
-This directly answers the maintainability complaints from earlier:
+Under the hood it runs every statement through `sql.begin(tx => [...])`:
+returning an array of queued queries from a transaction callback pipelines
+them onto the wire in one round trip *and* wraps them in a real transaction.
+Since our SQL and parameters are built dynamically rather than written as
+literal tagged templates, each statement goes through `tx.unsafe(sql,
+params, { prepare: true })` - the `prepare: true` matters here, since
+`unsafe()` defaults to `prepare: false`, which turned out to quietly opt
+each statement out of pipelining (confirmed by timing it: with the default,
+a 3-statement batch was *slower* than sending them one at a time; forcing
+`prepare: true` made it faster than both).
+
+This directly answers the maintainability complaints from earlier - and,
+unlike the plain multi-statement batching above, it keeps the single round
+trip *and* gets everything else:
 
 - **Real parameter binding** — `$1`, `$2`, ... per statement, not text
   interpolation.
+- **Still one round trip** — pipelined via `sql.begin`, the same mechanism
+  the plain batching demos use, just with real parameters this time.
 - **Typed results, not generic rows** — write a `RowMapper<T>` once per
   shape (see `examples/queryBuilder.ts`'s `productFromRow`) and `select`
   populates a `T[]` for you.
@@ -201,12 +216,6 @@ This directly answers the maintainability complaints from earlier:
 - **Errors point at the statement that failed** — each error carries the
   statement's index and label (e.g. `"insert duplicate gadget"`) and is
   logged to stderr as it happens.
-
-One honest trade-off: a single `pg` connection processes statements one at
-a time on the wire, so this batch is still N round trips, not one - what it
-buys you instead is safety and ergonomics (parameter binding, typed
-results, atomic rollback, precise error attribution), not the round-trip
-savings from the sections above.
 
 Select output uses plain array-reference semantics — `out` is the same
 array the caller passed in, mutated in place, so no special plumbing is
