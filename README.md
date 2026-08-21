@@ -153,3 +153,51 @@ typed values they'd get from `client.query()`, instead of parsing text
 everywhere the batch is used.
 
 Run it with `cargo run --example typed_results`.
+
+## A proper query builder
+
+The examples above are all built on `simple_query`, with the trade-offs
+documented above. `src/lib.rs` takes a different approach for when you want
+real ergonomics: a `QueryBuilder` you chain SELECTs, INSERTs, UPDATEs and
+DELETEs onto in any order, `build()` into a `QueryBatch`, and hand to
+`BatchExecutor::execute`. It's built on the extended (parameterized)
+protocol instead of `simple_query` text batching, pipelining every
+statement onto the connection rather than awaiting them one by one, and it
+runs the whole thing inside one real transaction:
+
+```rust
+let mut products: Vec<Product> = Vec::new();
+let mut rows_deleted: u64 = 0;
+
+let batch = QueryBuilder::new()
+    .insert("insert widget", "INSERT INTO poc_products (name, price) VALUES ($1, $2)", &[&"widget", &10])
+    .update("bump gadget price", "UPDATE poc_products SET price = price + 5 WHERE name = $1", &[&"gadget"])
+    .mutation_capturing("delete cheap products", "DELETE FROM poc_products WHERE price < $1", &[&10], &mut rows_deleted)
+    .select("all products", "SELECT id, name, price FROM poc_products ORDER BY id", &[], &mut products)
+    .build();
+
+BatchExecutor::execute(&mut client, batch).await?;
+// products and rows_deleted are populated here, but only if every
+// statement above succeeded.
+```
+
+This directly answers the maintainability complaints from earlier:
+
+- **Real parameter binding** — `$1`, `$2`, ... per statement, not text
+  interpolation.
+- **Typed results, not text parsing** — implement `FromRow` once per struct
+  (see `examples/query_builder.rs`'s `Product`) and `select` populates a
+  `Vec<T>` for you.
+- **Atomic by default** — the whole batch runs in one transaction. If any
+  statement fails, everything is rolled back and none of your output
+  variables get touched, instead of the "later statements silently
+  succeed/fail independently" surprise you'd get from plain pipelining.
+- **Errors point at the statement that failed** — each error carries the
+  statement's index and label (e.g. `"insert duplicate gadget"`) and is
+  logged to stderr as it happens.
+
+Output variables are populated through plain `&mut` references captured in
+a closure per statement, not raw pointers - safe, and the borrow checker
+guarantees they can't outlive the data they point at.
+
+Run it with `cargo run --example query_builder`.
