@@ -48,21 +48,29 @@ scheduling latency on its own.
 ## Does it actually help?
 
 Yes — and the more statements you fold into the batch, the more obvious it
-gets. `src/main.rs` actually runs 15 varied statements (aggregates, filters,
-a join, `version()`, `current_database()`, ...) across `poc_items`,
-`poc_categories` and `poc_customers`, not just the 3 shown above. Even on
-localhost, where round-trip latency is about as cheap as it gets, batching
-came out roughly **5.4x faster** over 200 iterations:
+gets. `src/main.rs` actually runs 500 statements (aggregates, filters, joins,
+`version()`, `current_database()`, and a long tail of cheap price-threshold
+filters) across `poc_items`, `poc_categories` and `poc_customers`, not just
+the handful shown above. Even on localhost, where round-trip latency is
+about as cheap as it gets, batching came out roughly **12x faster** over 50
+iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~1.0ms |
-| Separate (15 round trips) | ~5.5ms |
+| Batched (1 round trip) | ~14ms |
+| Separate (500 round trips) | ~170ms |
 
-The gap only grows on a real network — every extra round trip there costs
+Worth noting: the speedup isn't just "more statements = more speedup"
+without limit. Each statement still costs something to plan and execute on
+both sides of the comparison, so the ratio climbs fast at first and then
+levels off - going from 15 to 40 statements roughly doubled it, but naively
+adding more expensive statements (joins, aggregates) past that point can
+actually *shrink* the ratio, since their per-statement cost outweighs the
+extra round trip being saved. The 500-statement batch here leans on a long
+tail of cheap, uniform filters to keep pushing the ratio up. Either way, the
+gap only grows on a real network — every extra round trip there costs
 milliseconds, not microseconds, so batching pays off even more the further
-away your database is, and even more the more statements you'd otherwise be
-sending one by one.
+away your database is.
 
 ## The catch: maintainability
 
