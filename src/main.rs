@@ -18,17 +18,55 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(
             "DROP TABLE IF EXISTS poc_items CASCADE;
-             CREATE TABLE poc_items (id SERIAL PRIMARY KEY, name TEXT, price INT);
-             INSERT INTO poc_items (name, price) VALUES ('widget', 10), ('gadget', 25), ('gizmo', 5);",
+             DROP TABLE IF EXISTS poc_categories CASCADE;
+             DROP TABLE IF EXISTS poc_customers CASCADE;
+
+             CREATE TABLE poc_categories (id SERIAL PRIMARY KEY, name TEXT);
+             CREATE TABLE poc_items (
+                 id SERIAL PRIMARY KEY,
+                 name TEXT,
+                 price INT,
+                 category_id INT REFERENCES poc_categories(id)
+             );
+             CREATE TABLE poc_customers (id SERIAL PRIMARY KEY, name TEXT, email TEXT);
+
+             INSERT INTO poc_categories (name) VALUES ('tools'), ('electronics'), ('misc');
+
+             INSERT INTO poc_items (name, price, category_id) VALUES
+                 ('widget', 10, 1),
+                 ('gadget', 25, 2),
+                 ('gizmo', 5, 3),
+                 ('doohickey', 15, 1),
+                 ('thingamajig', 42, 2),
+                 ('contraption', 8, 3);
+
+             INSERT INTO poc_customers (name, email) VALUES
+                 ('alice', 'alice@example.com'),
+                 ('bob', 'bob@example.com'),
+                 ('carol', 'carol@example.com'),
+                 ('dave', 'dave@internal.test');",
         )
         .await?;
 
     // The trick: bundle unrelated SELECTs into one string and fire them through
     // simple_query. Postgres' simple query protocol treats the whole string as a
-    // single "Query" message, so all three statements travel in one round trip.
+    // single "Query" message, so every statement travels in one round trip -
+    // 15 of them here, to make the round-trip savings hard to miss.
     let batch = "SELECT count(*) FROM poc_items;
                  SELECT name FROM poc_items WHERE price > 10;
-                 SELECT now();";
+                 SELECT now();
+                 SELECT avg(price) FROM poc_items;
+                 SELECT max(price) FROM poc_items;
+                 SELECT min(price) FROM poc_items;
+                 SELECT sum(price) FROM poc_items;
+                 SELECT count(DISTINCT category_id) FROM poc_items;
+                 SELECT count(*) FROM poc_categories;
+                 SELECT name FROM poc_categories ORDER BY name;
+                 SELECT count(*) FROM poc_customers;
+                 SELECT name FROM poc_customers WHERE email LIKE '%@example.com';
+                 SELECT i.name FROM poc_items i JOIN poc_categories c ON i.category_id = c.id WHERE c.name = 'electronics';
+                 SELECT version();
+                 SELECT current_database();";
 
     let messages = client.simple_query(batch).await?;
 
@@ -44,8 +82,26 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         }
     }
 
-    // Now let's put a number on it: batched vs. the same 3 queries sent one
+    // Now let's put a number on it: batched vs. the same 15 queries sent one
     // at a time, each awaited before the next fires.
+    let separate_statements = [
+        "SELECT count(*) FROM poc_items",
+        "SELECT name FROM poc_items WHERE price > 10",
+        "SELECT now()",
+        "SELECT avg(price) FROM poc_items",
+        "SELECT max(price) FROM poc_items",
+        "SELECT min(price) FROM poc_items",
+        "SELECT sum(price) FROM poc_items",
+        "SELECT count(DISTINCT category_id) FROM poc_items",
+        "SELECT count(*) FROM poc_categories",
+        "SELECT name FROM poc_categories ORDER BY name",
+        "SELECT count(*) FROM poc_customers",
+        "SELECT name FROM poc_customers WHERE email LIKE '%@example.com'",
+        "SELECT i.name FROM poc_items i JOIN poc_categories c ON i.category_id = c.id WHERE c.name = 'electronics'",
+        "SELECT version()",
+        "SELECT current_database()",
+    ];
+
     let iterations = 200;
 
     let start = Instant::now();
@@ -56,21 +112,20 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     let start = Instant::now();
     for _ in 0..iterations {
-        client.query("SELECT count(*) FROM poc_items", &[]).await?;
-        client
-            .query("SELECT name FROM poc_items WHERE price > 10", &[])
-            .await?;
-        client.query("SELECT now()", &[]).await?;
+        for stmt in &separate_statements {
+            client.query(*stmt, &[]).await?;
+        }
     }
     let separate_elapsed = start.elapsed();
 
-    println!("\n--- timing over {iterations} iterations ---");
+    println!("\n--- timing over {iterations} iterations, {} statements each ---", separate_statements.len());
     println!(
-        "batched (1 round trip):    {batched_elapsed:?}  ({:?}/iter)",
+        "batched (1 round trip):     {batched_elapsed:?}  ({:?}/iter)",
         batched_elapsed / iterations
     );
     println!(
-        "separate (3 round trips):  {separate_elapsed:?}  ({:?}/iter)",
+        "separate ({} round trips):  {separate_elapsed:?}  ({:?}/iter)",
+        separate_statements.len(),
         separate_elapsed / iterations
     );
 

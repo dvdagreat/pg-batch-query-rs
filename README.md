@@ -47,17 +47,22 @@ scheduling latency on its own.
 
 ## Does it actually help?
 
-Yes — even on localhost, where round-trip latency is about as cheap as it
-gets, batching came out roughly **4-5x faster** over 200 iterations:
+Yes — and the more statements you fold into the batch, the more obvious it
+gets. `src/main.rs` actually runs 15 varied statements (aggregates, filters,
+a join, `version()`, `current_database()`, ...) across `poc_items`,
+`poc_categories` and `poc_customers`, not just the 3 shown above. Even on
+localhost, where round-trip latency is about as cheap as it gets, batching
+came out roughly **5.4x faster** over 200 iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~250-270µs |
-| Separate (3 round trips) | ~990µs-1.4ms |
+| Batched (1 round trip) | ~1.0ms |
+| Separate (15 round trips) | ~5.5ms |
 
 The gap only grows on a real network — every extra round trip there costs
 milliseconds, not microseconds, so batching pays off even more the further
-away your database is.
+away your database is, and even more the more statements you'd otherwise be
+sending one by one.
 
 ## The catch: maintainability
 
