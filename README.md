@@ -82,22 +82,32 @@ scheduling latency on its own.
 
 ## Does it actually help?
 
-Yes — and the more statements you fold into the batch, the more obvious it
-gets. `src/index.ts` actually runs 15 varied statements (aggregates,
-filters, a join, `version()`, `current_database()`, ...) across
-`poc_items`, `poc_categories` and `poc_customers`, not just the 3 shown
-above. Even on localhost, where round-trip latency is about as cheap as it
-gets, batching came out roughly **3x faster** over 200 iterations:
+Yes. `src/index.ts` runs 5,080 statements - the curated variety shown above
+(aggregates, filters, joins, `version()`, `current_database()`, ...) plus a
+long tail of cheap, uniform price-threshold filters, across `poc_items`,
+`poc_categories` and `poc_customers`. Even on localhost, where round-trip
+latency is about as cheap as it gets, batching came out roughly **6-7x
+faster** over 15 iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~0.99ms |
-| Separate (15 round trips) | ~3.10ms |
+| Batched (1 round trip) | ~125-135ms |
+| Separate (5,080 round trips) | ~790-825ms |
 
-The gap only grows on a real network — every extra round trip there costs
-milliseconds, not microseconds, so batching pays off even more the further
-away your database is, and even more the more statements you'd otherwise be
-sending one by one.
+Worth being upfront about: this ceiling is lower than the other two
+implementations in this repo hit with the same technique (Rust gets past
+10x). That's not a tuning miss - it held steady across statement counts from
+500 to 20,000, several `prepare` option combinations, and both `.unsafe()`
+and parameterized tagged-template calls for the "separate" baseline. Adding
+more statements past a few thousand actually made it *worse* (constructing
+and parsing one enormous batch has its own cost that starts to dominate).
+`postgres`'s per-call overhead for a one-off query is apparently just
+proportionally smaller relative to its own per-statement batch-processing
+cost than what Rust's driver has - so the two curves converge sooner. The
+underlying idea still holds: on a real network, where a round trip costs
+milliseconds instead of microseconds, that fixed per-call cost matters far
+more than it does here, so the gap only grows the further away your
+database is.
 
 ## The catch: maintainability
 
