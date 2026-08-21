@@ -30,6 +30,27 @@ either:
 This POC skips the ORM entirely and talks to Postgres directly. No query
 builder, no schema DSL — just SQL and one call.
 
+## Why `postgres` and not `pg`?
+
+`pg` is the most widely used Postgres driver for Node, but its `Client`
+processes queries strictly one at a time: even firing off several
+`.query()` calls without awaiting doesn't help, since it queues them and
+won't send the next one until the previous one's response has fully come
+back. There's no way to pipeline a set of queries into a single round trip.
+
+That's not a problem for the plain multi-statement batching this POC leans
+on below (that's a Postgres protocol feature, and works the same with any
+driver) — but it rules out ever building a proper query-builder abstraction
+that keeps the round-trip savings once you add real parameter binding,
+typed results, and transactions on top.
+
+`postgres` ([Postgres.js](https://github.com/porsager/postgres)) doesn't
+have that limitation: `sql.begin(tx => [...])` — returning an array of
+queued queries from a transaction callback — pipelines them onto the wire
+in one round trip and wraps them in a real transaction. That's the
+mechanism "A proper query builder" further down is built on, which is why
+`postgres` is the driver used everywhere in this repo, not just there.
+
 ## How it's solved
 
 The core trick: send several `SELECT`s as one semicolon-separated string
