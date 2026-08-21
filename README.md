@@ -82,17 +82,22 @@ scheduling latency on its own.
 
 ## Does it actually help?
 
-Yes — even on localhost, where round-trip latency is about as cheap as it
-gets, batching came out faster over 200 iterations:
+Yes — and the more statements you fold into the batch, the more obvious it
+gets. `src/index.ts` actually runs 15 varied statements (aggregates,
+filters, a join, `version()`, `current_database()`, ...) across
+`poc_items`, `poc_categories` and `poc_customers`, not just the 3 shown
+above. Even on localhost, where round-trip latency is about as cheap as it
+gets, batching came out roughly **3x faster** over 200 iterations:
 
 | Approach | Per iteration |
 |---|---|
-| Batched (1 round trip) | ~0.28ms |
-| Separate (3 round trips) | ~0.44ms |
+| Batched (1 round trip) | ~0.99ms |
+| Separate (15 round trips) | ~3.10ms |
 
 The gap only grows on a real network — every extra round trip there costs
 milliseconds, not microseconds, so batching pays off even more the further
-away your database is.
+away your database is, and even more the more statements you'd otherwise be
+sending one by one.
 
 ## The catch: maintainability
 
