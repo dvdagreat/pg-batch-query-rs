@@ -1,203 +1,75 @@
 # batch-fetch-postgres
 
-A tiny POC showing you can fire several unrelated `SELECT`s at Postgres in a
-**single network round trip**, instead of paying a round trip per query.
+A small POC exploring one question: can you fetch several Postgres queries
+in **one network round trip** instead of one round trip per query — and
+what does that cost you?
 
-## Why not just use an ORM?
+This branch is documentation only. The runnable code lives in per-language
+branches:
 
-Most Rust ORMs (Diesel, SeaORM, etc.) give you one query = one round trip.
-That's fine for a single fetch, but the moment a request needs three or four
-unrelated pieces of data, you end up either:
+| Branch | Language | Driver |
+|---|---|---|
+| [`rust-impl`](../../tree/rust-impl) | Rust | `tokio-postgres` |
+| [`node-impl`](../../tree/node-impl) | Node.js / TypeScript | `pg` |
+| [`golang-impl`](../../tree/golang-impl) | Go | `pgx` |
 
-- awaiting them one after another (N round trips, N × latency), or
-- reaching for the ORM's own batching/transaction APIs, which usually still
-  issue separate messages under the hood, or add a layer of query-building
-  machinery just to get there.
+Check out whichever branch matches the language you care about — each has
+its own README with runnable examples and the technical details specific to
+that driver.
 
-This POC skips the ORM entirely and talks to the wire protocol directly via
-`tokio-postgres`. No query builder, no macros, no schema DSL — just SQL
-strings and one method call.
+## The core problem
 
-## How it's solved
+An app that needs three unrelated pieces of data from Postgres usually pays
+for three round trips: send a query, wait for the reply, send the next one.
+Each round trip costs real latency, and it adds up fast the further away
+the database is.
 
-The core trick is `simple_query`. Postgres' simple query protocol lets you
-send a semicolon-separated batch of statements as **one** message; the server
-runs them in order and streams all the results back before a single
-`ReadyForQuery`:
+## The core idea
 
-```rust
-let batch = "SELECT count(*) FROM poc_items;
-             SELECT name FROM poc_items WHERE price > 10;
-             SELECT now();";
+Postgres can run several statements from a single message and hand back one
+result per statement — this is a feature of the wire protocol itself, not
+of any particular driver, so it holds regardless of language:
 
-let messages = client.simple_query(batch).await?;
+```sql
+SELECT count(*) FROM items;
+SELECT name FROM items WHERE price > 10;
+SELECT now();
 ```
 
-That's it — three unrelated queries, one call, one round trip. Compare that
-to the "normal" way:
+Sent as one batch, that's one round trip for all three queries instead of
+three. Every implementation in this repo builds on that same fact.
 
-```rust
-client.query("SELECT count(*) FROM poc_items", &[]).await?;
-client.query("SELECT name FROM poc_items WHERE price > 10", &[]).await?;
-client.query("SELECT now()", &[]).await?;
-```
+## What held true in every implementation
 
-which is three separate request/response cycles, each paying network and
-scheduling latency on its own.
+- **Batching independent reads** works the same way everywhere, since it's
+  Postgres behavior, not driver behavior: one round trip for N unrelated
+  statements.
+- **Dependent queries** (insert a row, then use its new id) can't be
+  batched as separate statements — the client never sees the new id in time
+  to use it. The fix is always the same: collapse both statements into one,
+  using a CTE with `RETURNING` to pass the value from one part of the query
+  to the next, still in a single round trip.
+- **A batch is one implicit transaction.** If a multi-statement batch has a
+  failing statement, everything earlier in that same batch gets rolled back
+  too — a real gotcha worth knowing about before relying on this.
+- **Real ergonomics cost something.** Plain multi-statement batching has no
+  parameter binding (values go into the SQL string by hand) and no typed
+  results (you parse rows yourself). Every implementation ends up building
+  a small "batch builder" abstraction to fix that — chain typed,
+  parameterized statements, run them in a transaction, get typed results
+  and clear per-statement errors back.
 
-## Does it actually help?
+## Where the languages actually differed
 
-Yes — even on localhost, where round-trip latency is about as cheap as it
-gets, batching came out roughly **4-5x faster** over 200 iterations:
+Building that batch builder is where the drivers diverge — not every
+language can keep the "one round trip" property once you add real
+parameter binding:
 
-| Approach | Per iteration |
-|---|---|
-| Batched (1 round trip) | ~250-270µs |
-| Separate (3 round trips) | ~990µs-1.4ms |
+| Language | Driver | Parameterized batch, still one round trip? |
+|---|---|---|
+| Go | `pgx` | Yes — `pgx` has a native pipelining API built for exactly this |
+| Rust | `tokio-postgres` | Yes — achieved manually, by firing queries concurrently without awaiting each one |
+| Node.js | `pg` | No — the driver sends queries strictly one at a time, so this trades the round-trip savings for the other benefits (typed results, atomicity, safety) |
 
-The gap only grows on a real network — every extra round trip there costs
-milliseconds, not microseconds, so batching pays off even more the further
-away your database is.
-
-## The catch: maintainability
-
-This is a performance win, not a free lunch:
-
-- No per-statement typed results — you track statement boundaries yourself
-  via `CommandComplete` (see `examples/typed_results.rs` for a fix).
-- No parameter binding — values go straight into the SQL string, which is a
-  SQL injection risk for user input.
-- One error fails the whole batch, and the failing statement isn't always
-  obvious.
-- Harder to review — one string of semicolon-joined SQL vs. separate,
-  readable queries.
-
-Best used for hot paths with known, non-parameterized reads — not as a
-default way to write queries.
-
-## What about dependent queries?
-
-`simple_query` batches statements as static text sent all at once, so it
-can't handle a query that needs a value produced by the one before it — e.g.
-insert a record, then use its new id in the next insert. The client never
-sees that id in time to splice it into the batch.
-
-`examples/dependent_queries.rs` shows the fix: fold both statements into one
-query with a data-modifying CTE. The `INSERT ... RETURNING` feeds the id
-straight into the next `INSERT` inside Postgres itself, so it's still a
-single round trip — and since it's one real statement, normal parameter
-binding (`$1`, `$2`) works too:
-
-```rust
-let row = client
-    .query_one(
-        "WITH new_item AS (
-             INSERT INTO poc_items (name, price) VALUES ($1, $2)
-             RETURNING id
-         )
-         INSERT INTO poc_order_events (item_id, event_type)
-         SELECT id, 'created' FROM new_item
-         RETURNING id, item_id, event_type",
-        &[&"thingamajig", &42],
-    )
-    .await?;
-```
-
-Run it with `cargo run --example dependent_queries`.
-
-## What if a query in the batch fails?
-
-`examples/error_handling.rs` shows the other gotcha: a multi-statement
-`simple_query` batch runs as one implicit transaction. If a later statement
-errors, everything earlier in that same batch is rolled back too - even a
-successful insert.
-
-```rust
-match client.simple_query(batch).await {
-    Ok(_) => println!("batch succeeded"),
-    Err(err) => {
-        if let Some(db_err) = err.as_db_error() {
-            println!("batch failed: {}", db_err.message());
-        }
-    }
-}
-```
-
-`tokio_postgres::Error::as_db_error()` gives you the Postgres error message
-and `SqlState` (e.g. `UNIQUE_VIOLATION`) so you can branch on what went
-wrong. The example proves the rollback by re-querying the table afterward -
-the row from the first, individually-valid insert is gone.
-
-Run it with `cargo run --example error_handling`.
-
-## Getting typed results back
-
-`examples/typed_results.rs` addresses the other maintainability complaint
-above: `simple_query` only gives you untyped text rows. The fix is to define
-a small struct per statement and parse each row into it once, right where
-the batch is issued:
-
-```rust
-struct ItemCount { count: i64 }
-
-impl ItemCount {
-    fn from_row(row: &SimpleQueryRow) -> Self {
-        Self { count: row.get(0).unwrap_or("0").parse().unwrap_or(0) }
-    }
-}
-```
-
-Since the statement order in the batch is known, each row just gets routed
-to the matching struct as the results stream in — callers get back the same
-typed values they'd get from `client.query()`, instead of parsing text
-everywhere the batch is used.
-
-Run it with `cargo run --example typed_results`.
-
-## A proper query builder
-
-The examples above are all built on `simple_query`, with the trade-offs
-documented above. `src/lib.rs` takes a different approach for when you want
-real ergonomics: a `QueryBuilder` you chain SELECTs, INSERTs, UPDATEs and
-DELETEs onto in any order, `build()` into a `QueryBatch`, and hand to
-`BatchExecutor::execute`. It's built on the extended (parameterized)
-protocol instead of `simple_query` text batching, pipelining every
-statement onto the connection rather than awaiting them one by one, and it
-runs the whole thing inside one real transaction:
-
-```rust
-let mut products: Vec<Product> = Vec::new();
-let mut rows_deleted: u64 = 0;
-
-let batch = QueryBuilder::new()
-    .insert("insert widget", "INSERT INTO poc_products (name, price) VALUES ($1, $2)", &[&"widget", &10])
-    .update("bump gadget price", "UPDATE poc_products SET price = price + 5 WHERE name = $1", &[&"gadget"])
-    .mutation_capturing("delete cheap products", "DELETE FROM poc_products WHERE price < $1", &[&10], &mut rows_deleted)
-    .select("all products", "SELECT id, name, price FROM poc_products ORDER BY id", &[], &mut products)
-    .build();
-
-BatchExecutor::execute(&mut client, batch).await?;
-// products and rows_deleted are populated here, but only if every
-// statement above succeeded.
-```
-
-This directly answers the maintainability complaints from earlier:
-
-- **Real parameter binding** — `$1`, `$2`, ... per statement, not text
-  interpolation.
-- **Typed results, not text parsing** — implement `FromRow` once per struct
-  (see `examples/query_builder.rs`'s `Product`) and `select` populates a
-  `Vec<T>` for you.
-- **Atomic by default** — the whole batch runs in one transaction. If any
-  statement fails, everything is rolled back and none of your output
-  variables get touched, instead of the "later statements silently
-  succeed/fail independently" surprise you'd get from plain pipelining.
-- **Errors point at the statement that failed** — each error carries the
-  statement's index and label (e.g. `"insert duplicate gadget"`) and is
-  logged to stderr as it happens.
-
-Output variables are populated through plain `&mut` references captured in
-a closure per statement, not raw pointers - safe, and the borrow checker
-guarantees they can't outlive the data they point at.
-
-Run it with `cargo run --example query_builder`.
+That difference, and the reasoning behind it, is covered in more depth in
+each branch's own README.
