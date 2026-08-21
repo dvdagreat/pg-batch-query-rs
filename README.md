@@ -81,3 +81,34 @@ what the language can do.
 
 That choice, and a non-obvious flag the batch builder needs to actually
 pipeline, is covered in more depth on `node-impl`'s own README.
+
+## How big can the speedup actually get?
+
+Every number above came from a handful of statements. Push further -
+hundreds or thousands of unrelated statements in one batch - and the
+round-trip savings get dramatic, but not in the naive "more statements =
+more speedup, forever" way you might expect:
+
+- **The speedup peaks, then falls.** Every statement still costs something
+  to plan and execute on both sides of the comparison. Add enough of them
+  and that per-statement cost starts to dominate over the round trips being
+  saved - confirmed independently in all three implementations, each
+  hitting its best ratio somewhere in the low thousands of statements, then
+  getting *worse* past that (constructing and parsing one truly huge batch
+  has its own real cost).
+- **Cheap, uniform statements beat complex ones for this.** A batch full of
+  joins and aggregates dilutes the round-trip savings faster, statement for
+  statement, than a batch of simple filters does - so padding a batch out
+  for volume works best with cheap statements, not necessarily "realistic"
+  ones.
+- **The achievable ceiling is a driver property, not a language one -
+  again.** Rust's `tokio-postgres` has low enough per-statement overhead to
+  clear 10x this way. Node's `postgres` and Go's `pgx` both plateau lower
+  (roughly 5-7x) for this exact technique - verified across a wide range of
+  statement counts rather than assumed - because their per-statement
+  client-side processing (parsing rows, allocating per value) is
+  proportionally more expensive relative to the round trip being saved.
+
+None of this changes the underlying lesson - it just shows the lesson has a
+shape, not a straight line. The exact numbers, and how each implementation
+found its own ceiling, are on the relevant branch's README.
