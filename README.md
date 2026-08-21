@@ -10,7 +10,7 @@ branches:
 | Branch | Language | Driver |
 |---|---|---|
 | [`rust-impl`](../../tree/rust-impl) | Rust | `tokio-postgres` |
-| [`node-impl`](../../tree/node-impl) | Node.js / TypeScript | `pg` |
+| [`node-impl`](../../tree/node-impl) | Node.js / TypeScript | `postgres` |
 | [`golang-impl`](../../tree/golang-impl) | Go | `pgx` |
 
 Check out whichever branch matches the language you care about — each has
@@ -59,17 +59,26 @@ three. Every implementation in this repo builds on that same fact.
   parameterized statements, run them in a transaction, get typed results
   and clear per-statement errors back.
 
-## Where the languages actually differed
+## Where this turned out to be a driver choice, not a language limit
 
-Building that batch builder is where the drivers diverge — not every
-language can keep the "one round trip" property once you add real
-parameter binding:
+Building that batch builder is where things first diverged — not every
+driver can keep the "one round trip" property once you add real parameter
+binding:
 
 | Language | Driver | Parameterized batch, still one round trip? |
 |---|---|---|
-| Go | `pgx` | Yes — `pgx` has a native pipelining API built for exactly this |
+| Go | `pgx` | Yes — has a native pipelining API built for exactly this |
 | Rust | `tokio-postgres` | Yes — achieved manually, by firing queries concurrently without awaiting each one |
-| Node.js | `pg` | No — the driver sends queries strictly one at a time, so this trades the round-trip savings for the other benefits (typed results, atomicity, safety) |
+| Node.js | `pg` | No — sends queries strictly one at a time, no pipelining at all |
 
-That difference, and the reasoning behind it, is covered in more depth in
-each branch's own README.
+`pg` is the most widely used Postgres driver for Node, so that looked like
+a real language-level gap at first. It wasn't: switching to a different
+driver, [`postgres`](https://github.com/porsager/postgres), closed it
+completely — its `sql.begin(tx => [...])` pipelines an array of queries
+into one round trip and wraps them in a transaction, matching what Go and
+Rust could already do. The lesson generalizes: if your batch builder can't
+keep the round-trip savings, check whether that's actually the language, or
+just the specific driver in front of you.
+
+That switch, and a non-obvious flag it needed to actually pipeline, is
+covered in more depth on `node-impl`'s own README.
