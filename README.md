@@ -59,26 +59,25 @@ three. Every implementation in this repo builds on that same fact.
   parameterized statements, run them in a transaction, get typed results
   and clear per-statement errors back.
 
-## Where this turned out to be a driver choice, not a language limit
+## Where this comes down to driver choice, not language
 
-Building that batch builder is where things first diverged — not every
-driver can keep the "one round trip" property once you add real parameter
-binding:
+Building that batch builder is where the driver you pick actually matters —
+not every Postgres driver can keep the "one round trip" property once you
+add real parameter binding:
 
 | Language | Driver | Parameterized batch, still one round trip? |
 |---|---|---|
 | Go | `pgx` | Yes — has a native pipelining API built for exactly this |
 | Rust | `tokio-postgres` | Yes — achieved manually, by firing queries concurrently without awaiting each one |
-| Node.js | `pg` | No — sends queries strictly one at a time, no pipelining at all |
+| Node.js | `postgres` | Yes — `sql.begin(tx => [...])` pipelines an array of queries into one round trip and wraps them in a transaction |
 
-`pg` is the most widely used Postgres driver for Node, so that looked like
-a real language-level gap at first. It wasn't: switching to a different
-driver, [`postgres`](https://github.com/porsager/postgres), closed it
-completely — its `sql.begin(tx => [...])` pipelines an array of queries
-into one round trip and wraps them in a transaction, matching what Go and
-Rust could already do. The lesson generalizes: if your batch builder can't
-keep the round-trip savings, check whether that's actually the language, or
-just the specific driver in front of you.
+Node's most widely used Postgres driver, `pg`, can't do this — its `Client`
+sends queries strictly one at a time, with no way to pipeline. That's why
+`node-impl` uses [`postgres`](https://github.com/porsager/postgres)
+(Postgres.js) instead: it's the driver that keeps every example, including
+the batch builder, down to one round trip. The lesson generalizes — a
+driver that can't pipeline is a property of that driver, not a ceiling on
+what the language can do.
 
-That switch, and a non-obvious flag it needed to actually pipeline, is
-covered in more depth on `node-impl`'s own README.
+That choice, and a non-obvious flag the batch builder needs to actually
+pipeline, is covered in more depth on `node-impl`'s own README.
